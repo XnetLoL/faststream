@@ -588,6 +588,9 @@ class _StreamHandlerMixin(LogicSubscriber):
 
         self.stream_sub = stream
         self.last_id = stream.last_id
+        # Track active tasks for concurrent processing
+        self._active_tasks: set[asyncio.Task] = set()
+        self._max_active_tasks = stream.max_concurrent or 1
 
     def __hash__(self) -> int:
         return hash(self.stream_sub)
@@ -600,6 +603,30 @@ class _StreamHandlerMixin(LogicSubscriber):
             message=message,
             channel=self.stream_sub.name,
         )
+
+    async def _process_message(self, msg: Any) -> None:
+        """Process a single message and remove its task from active tasks."""
+        try:
+            await self.consume(msg)  # type: ignore[arg-type]
+        finally:
+            # Find and remove the task from active tasks
+            current_task = asyncio.current_task()
+            if current_task:
+                self._active_tasks.discard(current_task)
+
+    async def _wait_for_slot(self) -> None:
+        """Wait until there's a free slot for processing."""
+        while len(self._active_tasks) >= self._max_active_tasks:
+            # Wait for any task to complete
+            done, pending = await asyncio.wait(
+                self._active_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            # Clean up completed tasks
+            for task in done:
+                self._active_tasks.discard(task)
+                # Propagate any exceptions
+                if not task.cancelled():
+                    await task
 
     @override
     async def _consume(self, *args: Any, start_signal: anyio.Event) -> None:
@@ -750,6 +777,16 @@ class _StreamHandlerMixin(LogicSubscriber):
         new_stream.name = "".join((prefix, new_stream.name))
         self.stream_sub = new_stream
 
+    async def close(self) -> None:
+        # Cancel and wait for all active tasks before closing
+        if self._active_tasks:
+            for task in self._active_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
+            self._active_tasks.clear()
+        await super().close()
+
 
 class StreamSubscriber(_StreamHandlerMixin):
     def __init__(
@@ -809,6 +846,7 @@ class StreamSubscriber(_StreamHandlerMixin):
             if msgs:
                 self.last_id = msgs[-1][0].decode()
 
+                # Create message objects for all messages
                 for message_id, raw_msg in msgs:
                     msg = DefaultStreamMessage(
                         type="stream",
@@ -817,7 +855,12 @@ class StreamSubscriber(_StreamHandlerMixin):
                         data=raw_msg,
                     )
 
-                    await self.consume(msg)  # type: ignore[arg-type]
+                    # Wait for a processing slot if we're at max capacity
+                    await self._wait_for_slot()
+
+                    # Create and track new task
+                    task = asyncio.create_task(self._process_message(msg))
+                    self._active_tasks.add(task)
 
 
 class BatchStreamSubscriber(_StreamHandlerMixin):
@@ -866,17 +909,48 @@ class BatchStreamSubscriber(_StreamHandlerMixin):
             if msgs:
                 self.last_id = msgs[-1][0].decode()
 
-                data: List[Dict[bytes, bytes]] = []
-                ids: List[bytes] = []
-                for message_id, i in msgs:
-                    data.append(i)
-                    ids.append(message_id)
+                # Group messages into batches based on max_concurrent
+                if self.stream_sub.max_concurrent:
+                    # Calculate number of messages per batch
+                    total_msgs = len(msgs)
+                    batch_size = max(1, total_msgs // self.stream_sub.max_concurrent)
 
-                msg = BatchStreamMessage(
-                    type="bstream",
-                    channel=stream_name.decode(),
-                    data=data,
-                    message_ids=ids,
-                )
+                    # Create batches
+                    batches = []
+                    for i in range(0, total_msgs, batch_size):
+                        batch_msgs = msgs[i : i + batch_size]
+                        data = []
+                        ids = []
+                        for message_id, msg_data in batch_msgs:
+                            data.append(msg_data)
+                            ids.append(message_id)
 
-                await self.consume(msg)  # type: ignore[arg-type]
+                        batches.append(
+                            BatchStreamMessage(
+                                type="bstream",
+                                channel=stream_name.decode(),
+                                data=data,
+                                message_ids=ids,
+                            )
+                        )
+
+                    # Process batches concurrently
+                    await asyncio.gather(
+                        *(self.consume(batch) for batch in batches)  # type: ignore[arg-type]
+                    )
+                else:
+                    # Original sequential processing
+                    data: List[Dict[bytes, bytes]] = []
+                    ids: List[bytes] = []
+                    for message_id, i in msgs:
+                        data.append(i)
+                        ids.append(message_id)
+
+                    msg = BatchStreamMessage(
+                        type="bstream",
+                        channel=stream_name.decode(),
+                        data=data,
+                        message_ids=ids,
+                    )
+
+                    await self.consume(msg)  # type: ignore[arg-type]

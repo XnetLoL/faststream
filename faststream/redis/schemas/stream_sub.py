@@ -13,6 +13,7 @@ class StreamSub(NameRequired):
         "consumer",
         "group",
         "last_id",
+        "max_concurrent",
         "max_records",
         "maxlen",
         "name",
@@ -31,6 +32,7 @@ class StreamSub(NameRequired):
         last_id: Optional[str] = None,
         maxlen: Optional[int] = None,
         max_records: Optional[int] = None,
+        max_concurrent: Optional[int] = None,
     ) -> None:
         if (group and not consumer) or (not group and consumer):
             raise SetupError("You should specify `group` and `consumer` both")
@@ -55,6 +57,7 @@ class StreamSub(NameRequired):
         self.last_id = last_id
         self.maxlen = maxlen
         self.max_records = max_records
+        self.max_concurrent = max_concurrent
 
     def __hash__(self) -> int:
         if self.group is not None:
